@@ -29,7 +29,6 @@ def create_pipeline():
     # Create Neural Network node
     detection_nn = pipeline.create(dai.node.NeuralNetwork)
     detection_nn.setBlobPath(MODEL_PATH)
-    detection_nn.setConfidenceThreshold(CONFIDENCE_THRESHOLD)
     detection_nn.input.setBlocking(False)
 
     # Create output streams
@@ -48,34 +47,72 @@ def create_pipeline():
 
 def parse_yolo_output(output, img_width, img_height):
     """Parse YOLO output to get bounding boxes"""
-    # This is a simplified parser - you might need to adjust based on your model's exact output format
     detections = []
     
-    # YOLO output format: [batch, num_detections, 85] where 85 = 4 coords + 1 confidence + 80 classes
-    # For your custom model, the last dimension will be 4 + 1 + num_classes
-    for detection in output[0]:
-        confidence = detection[4]
-        if confidence > CONFIDENCE_THRESHOLD:
-            # Get class scores
-            class_scores = detection[5:]
-            class_id = np.argmax(class_scores)
-            class_confidence = class_scores[class_id]
+    # Get the raw output data
+    if hasattr(output, 'getFirstLayerFp16'):
+        data = np.array(output.getFirstLayerFp16()).astype(np.float32)
+    elif hasattr(output, 'getLayerFp16'):
+        data = np.array(output.getLayerFp16(output.getAllLayerNames()[0])).astype(np.float32)
+    else:
+        print("Could not get output data from model")
+        return detections
+    
+    print(f"Model output shape: {data.shape}")  # Debug info
+    
+    # YOLOv5 output format is typically [1, 25200, 85] for COCO (80 classes)
+    # For your custom model with 2 classes, it should be [1, 25200, 7] (4 coords + 1 conf + 2 classes)
+    if len(data.shape) == 3:
+        # Remove batch dimension if present
+        data = data[0]
+    
+    if len(data.shape) != 2:
+        print(f"Unexpected output shape: {data.shape}")
+        return detections
+    
+    # Each detection: [center_x, center_y, width, height, confidence, class1_prob, class2_prob, ...]
+    for detection in data:
+        if len(detection) < 5:
+            continue
             
-            if class_confidence > CONFIDENCE_THRESHOLD:
-                # Convert center coordinates to corner coordinates
-                center_x, center_y, width, height = detection[0:4]
-                
-                # Convert to pixel coordinates
-                x1 = int((center_x - width/2) * img_width)
-                y1 = int((center_y - height/2) * img_height)
-                x2 = int((center_x + width/2) * img_width)
-                y2 = int((center_y + height/2) * img_height)
-                
-                detections.append({
-                    'class_id': int(class_id),
-                    'confidence': float(class_confidence),
-                    'box': [x1, y1, x2, y2]
-                })
+        center_x, center_y, width, height, obj_conf = detection[0:5]
+        
+        # Skip low confidence detections
+        if obj_conf < CONFIDENCE_THRESHOLD:
+            continue
+        
+        # Get class probabilities
+        if len(detection) > 5:
+            class_probs = detection[5:]
+            class_id = np.argmax(class_probs)
+            class_conf = class_probs[class_id] * obj_conf  # Multiply by objectness confidence
+        else:
+            # If no class probabilities, assume single class
+            class_id = 0
+            class_conf = obj_conf
+        
+        # Skip if final confidence is too low
+        if class_conf < CONFIDENCE_THRESHOLD:
+            continue
+        
+        # Convert normalized coordinates to pixel coordinates
+        # YOLOv5 outputs normalized coordinates (0-1)
+        x1 = int((center_x - width/2) * img_width)
+        y1 = int((center_y - height/2) * img_height)
+        x2 = int((center_x + width/2) * img_width)
+        y2 = int((center_y + height/2) * img_height)
+        
+        # Clamp coordinates to image bounds
+        x1 = max(0, min(x1, img_width-1))
+        y1 = max(0, min(y1, img_height-1))
+        x2 = max(0, min(x2, img_width-1))
+        y2 = max(0, min(y2, img_height-1))
+        
+        detections.append({
+            'class_id': int(class_id),
+            'confidence': float(class_conf),
+            'box': [x1, y1, x2, y2]
+        })
     
     return detections
 
@@ -130,7 +167,7 @@ def main():
             in_det = q_det.tryGet()
             if in_det is not None:
                 # Parse detections
-                detections = parse_yolo_output(in_det.getFirstLayerFp16(), INPUT_SIZE, INPUT_SIZE)
+                detections = parse_yolo_output(in_det, INPUT_SIZE, INPUT_SIZE)
                 
                 # Draw detections on frame
                 frame = draw_detections(frame, detections)
