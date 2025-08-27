@@ -58,48 +58,49 @@ def parse_yolo_output(output, img_width, img_height):
         print("Could not get output data from model")
         return detections
     
-    print(f"Model output shape: {data.shape}")
-    print(f"Max value in output: {np.max(data)}")
+    print(f"Raw data range: min={np.min(data):.3f}, max={np.max(data):.3f}")
     
     # Handle flat array output - reshape based on expected format
-    # For YOLOv5 with 2 classes: 85176 / 7 = 12168 detections
-    # Each detection: [x, y, w, h, conf, class1_prob, class2_prob]
-    
     if len(data.shape) == 1:
-        # Determine number of classes from array size
         if data.shape[0] % 7 == 0:  # 2-class model
             num_detections = data.shape[0] // 7
-            num_classes = 2
             data = data.reshape(num_detections, 7)
         elif data.shape[0] % 85 == 0:  # 80-class model (COCO)
             num_detections = data.shape[0] // 85
-            num_classes = 80
             data = data.reshape(num_detections, 85)
         else:
             print(f"Cannot determine model format from shape {data.shape}")
             return detections
-            
-        print(f"Reshaped to: {data.shape} ({num_detections} detections, {num_classes} classes)")
     
     if len(data.shape) == 3:
-        # Remove batch dimension if present
         data = data[0]
     
-    if len(data.shape) != 2:
-        print(f"Still unexpected output shape after reshaping: {data.shape}")
-        return detections
+    print(f"Reshaped data: {data.shape}")
     
-    # Parse each detection
+    # Sample a few detections to understand the format
+    print("Sample raw detections:")
+    for i in range(min(3, len(data))):
+        print(f"  Detection {i}: {data[i]}")
+    
+    # Parse each detection with much more conservative approach
+    valid_detections = 0
     for i, detection in enumerate(data):
         if len(detection) < 5:
             continue
             
         center_x, center_y, width, height, obj_conf = detection[0:5]
         
-        # The confidence values might not be normalized - check if they need sigmoid
-        if obj_conf > 10:  # If confidence is too high, apply sigmoid
+        # Don't apply sigmoid automatically - check if values are reasonable first
+        original_conf = obj_conf
+        
+        # Only apply sigmoid if confidence seems to be in logit space (very high/low values)
+        if obj_conf > 5 or obj_conf < -5:
             obj_conf = 1.0 / (1.0 + np.exp(-obj_conf))
         
+        # Skip completely unreasonable confidences
+        if obj_conf <= 0 or obj_conf > 1:
+            continue
+            
         # Skip low confidence detections
         if obj_conf < CONFIDENCE_THRESHOLD:
             continue
@@ -108,44 +109,50 @@ def parse_yolo_output(output, img_width, img_height):
         if len(detection) > 5:
             class_probs = detection[5:]
             
-            # Apply sigmoid to class probabilities if they're too high
-            if np.max(class_probs) > 10:
+            # Same logic for class probabilities
+            if np.max(class_probs) > 5 or np.min(class_probs) < -5:
                 class_probs = 1.0 / (1.0 + np.exp(-class_probs))
             
             class_id = np.argmax(class_probs)
             class_conf = class_probs[class_id] * obj_conf
         else:
-            # If no class probabilities, assume single class
             class_id = 0
             class_conf = obj_conf
         
         # Skip if final confidence is too low
         if class_conf < CONFIDENCE_THRESHOLD:
             continue
+            
+        # More conservative coordinate parsing
+        # Check if coordinates seem reasonable (0-1 range or pixel coordinates)
         
-        # Convert coordinates - they might be in different formats
-        # Try both normalized (0-1) and pixel coordinates
-        if max(center_x, center_y, width, height) <= 1.0:
-            # Normalized coordinates (0-1)
+        # If all coordinates are very small (< 1), assume normalized
+        if max(abs(center_x), abs(center_y), abs(width), abs(height)) <= 1.0:
             x1 = int((center_x - width/2) * img_width)
             y1 = int((center_y - height/2) * img_height)
             x2 = int((center_x + width/2) * img_width)
             y2 = int((center_y + height/2) * img_height)
         else:
-            # Already in pixel coordinates
+            # Assume pixel coordinates, but this seems unlikely for your model
             x1 = int(center_x - width/2)
             y1 = int(center_y - height/2)
             x2 = int(center_x + width/2)
             y2 = int(center_y + height/2)
         
-        # Clamp coordinates to image bounds
+        # Clamp coordinates
         x1 = max(0, min(x1, img_width-1))
         y1 = max(0, min(y1, img_height-1))
         x2 = max(0, min(x2, img_width-1))
         y2 = max(0, min(y2, img_height-1))
         
-        # Skip invalid boxes
-        if x2 <= x1 or y2 <= y1:
+        # Skip invalid or very small boxes
+        box_width = x2 - x1
+        box_height = y2 - y1
+        
+        if box_width < 10 or box_height < 10:  # Skip tiny boxes
+            continue
+        
+        if box_width > img_width * 0.9 or box_height > img_height * 0.9:  # Skip huge boxes
             continue
             
         detections.append({
@@ -154,11 +161,21 @@ def parse_yolo_output(output, img_width, img_height):
             'box': [x1, y1, x2, y2]
         })
         
-        # Debug: print first few detections
-        if len(detections) <= 3:
-            print(f"Detection {len(detections)}: class={class_id}, conf={class_conf:.3f}, box=[{x1},{y1},{x2},{y2}]")
+        valid_detections += 1
+        
+        # Debug: print details of first few valid detections
+        if valid_detections <= 5:
+            print(f"Valid detection {valid_detections}:")
+            print(f"  Raw values: cx={center_x:.3f}, cy={center_y:.3f}, w={width:.3f}, h={height:.3f}")
+            print(f"  Original conf={original_conf:.3f}, processed conf={class_conf:.3f}")
+            print(f"  Final box: [{x1},{y1},{x2},{y2}] (w={box_width}, h={box_height})")
+        
+        # Safety limit - don't process too many detections
+        if valid_detections >= 50:
+            print(f"Stopping after {valid_detections} detections to prevent overflow")
+            break
     
-    print(f"Total detections after filtering: {len(detections)}")
+    print(f"Total valid detections: {len(detections)}")
     return detections
 
 def draw_detections(frame, detections):
