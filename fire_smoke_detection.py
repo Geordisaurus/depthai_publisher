@@ -6,14 +6,13 @@ import numpy as np
 import time
 
 # Configuration
-MODEL_PATH = "fire_smoke_detector.blob"  # Update this path to your downloaded .blob file
-CONFIDENCE_THRESHOLD = 0.5
+MODEL_PATH = "/Users/geordihills/.cache/blobconverter/best_openvino_2022.1_6shave.blob"
+CONFIDENCE_THRESHOLD = 0.3  # Start lower to see more detections
 NMS_THRESHOLD = 0.4
 INPUT_SIZE = 416
 
-# Class names - update these based on your training data
-# From your notebook, it looks like you were training on fire & smoke detection
-CLASS_NAMES = ["fire", "smoke"]  # Update based on your data.yaml file
+# Class names - based on your fire & smoke detection training
+CLASS_NAMES = ["fire", "smoke"]
 
 def create_pipeline():
     """Create DepthAI pipeline"""
